@@ -1,8 +1,9 @@
-# Load Libraries
+# Final - 21st april Load Libraries
 library(shiny)
 library(shinydashboard)
 library(shinyWidgets)
 library(plotly)
+library(leaflet)
 library(dplyr)
 library(magrittr) 
 library(ggplot2)
@@ -15,102 +16,211 @@ library(tidyr)
 library(rmarkdown)
 library(shinycssloaders)
 
-# Sample Data
-get_sample_data <- function() {
-  tibble(
-    LOCATION_NAME = sample(c("Karnataka", "Tamil Nadu", "Maharashtra", "Kerala", "Andhra Pradesh", "Gujarat", "Punjab", "West Bengal", "Odisha", "Bihar"), 20, replace = TRUE),
-    CA = runif(20, 20, 100),
-    MG = runif(20, 10, 50),
-    Sodium = runif(20, 30, 150),
-    K = runif(20, 2, 10),
-    CHLORIDE = runif(20, 50, 250),
-    SULPHATE = runif(20, 40, 200),
-    BICARBONATE = runif(20, 80, 300)
+# Custom color palette
+iisc_palette <- c(
+  primary = "#005A9C",
+  secondary = "#00A86B",
+  accent = "#4FC3F7",
+  background = "#F0F4F8",
+  text = "#2C3E50"
+)
+
+
+
+# WQI Calculation Function
+calculate_wqi <- function(gpkg_path) {
+  layer_name <- st_layers(gpkg_path)$name[1]
+  water_sf <- st_read(gpkg_path, layer = layer_name, quiet = TRUE)
+  
+  # Ensure WGS84 projection
+  if (sf::st_crs(water_sf)$epsg != 4326) {
+    water_sf <- st_transform(water_sf, 4326)
+  }
+  
+  # Validate geometries
+  if (!all(st_is_valid(water_sf))) {
+    water_sf <- st_make_valid(water_sf)
+  }
+  
+  # Rename "NA" column to "Sodium" if present
+  if ("NA" %in% names(water_sf)) {
+    names(water_sf)[names(water_sf) == "NA"] <- "Sodium"
+  }
+  
+  standards <- list(
+    TDS = list(St = 1000, Wi = 0.121),
+    EC = list(St = 2500, Wi = 0.121),
+    NITRATE = list(St = 50, Wi = 0.152),
+    SULPHATE = list(St = 250, Wi = 0.121),
+    CHLORIDE = list(St = 250, Wi = 0.093),
+    BICARBONATE = list(St = 500, Wi = 0.152),
+    FLUORIDE = list(St = 1.2, Wi = 0.030),
+    CA = list(St = 100, Wi = 0.060),
+    MG = list(St = 50, Wi = 0.060),
+    Sodium = list(St = 200, Wi = 0.060),
+    K = list(St = 20, Wi = 0.030)
   )
+  
+  water_sf$WQI <- NA_real_
+  param_names <- names(standards)
+  
+  # Replace missing parameters with 0
+  for (param in param_names) {
+    if (!param %in% names(water_sf)) {
+      water_sf[[param]] <- 0
+    } else {
+      water_sf[[param]][is.na(water_sf[[param]])] <- 0
+    }
+  }
+  
+  for (param in param_names) {
+    qi_col <- paste0("qi_", param)
+    sli_col <- paste0("SLi_", param)
+    water_sf[[qi_col]] <- water_sf[[param]] / standards[[param]]$St
+    water_sf[[sli_col]] <- water_sf[[qi_col]] * standards[[param]]$Wi
+  }
+  
+  sli_cols <- paste0("SLi_", param_names)
+  sli_values <- st_drop_geometry(water_sf)[, sli_cols]
+  sli_values[] <- lapply(sli_values, as.numeric)
+  water_sf$WQI <- rowSums(sli_values, na.rm = TRUE)
+  
+  water_sf$Quality <- cut(
+    water_sf$WQI,
+    breaks = c(-Inf, 0.5, 1, 2, 3, Inf),
+    labels = c("Excellent", "Good", "Poor", "Very Poor", "Unsuitable"),
+    right = FALSE
+  )
+  
+  # Write CSV output with WQI and Quality columns
+  csv_path <- file.path(getwd(), "water_quality_output.csv")
+  write.csv(st_drop_geometry(water_sf), csv_path, row.names = FALSE)
+  
+  return(water_sf)
 }
 
 # UI
 ui <- dashboardPage(
+  
+  
+  
   title = "Ground Water Assessment Dashboard",
   skin = "blue",
   
   dashboardHeader(
     title = tags$div(
-      style = "display: flex; align-items: center; height: 60px;",
-      tags$span("🌊 Ground Water Assessment", style = "font-size: 18px; font-weight: bold; color: white;")
+      
+      
+      style = "display: flex; align-items: center; height: 60px; background-color: transparent;",
+      tags$img(src = "sirpilogo white.avif", height = "30px", style = "margin-right: 10px;"),
+      tags$img(src = "gdx_logo.png", height = "30px", style = "margin-right: 10px;"), # Add your second logo here
+      
+      
+      tags$span("Ground Water Assessment Dashboard",
+                style = "color: white; font-weight: bold; font-size: 18px; margin-left: 30px;")
     ),
-    titleWidth = 300
-  ), 
+    titleWidth = 650
+  ),
   
   dashboardSidebar(
-    width = 250,
     sidebarMenu(
-      menuItem("📁 File Upload", tabName = "upload", icon = icon("upload")),
-      menuItem("📊 Data Exploration", tabName = "data_explore", icon = icon("chart-bar")),
-      menuItem("💧 Chemistry Analysis", tabName = "chemistry", icon = icon("flask"))
+      menuItem("File Upload", tabName = "upload", icon = icon("upload")),
+      menuItem("Data Exploration", tabName = "data_explore", icon = icon("magnifying-glass")),
+      menuItem("Ground Water Chemistry", tabName = "chemistry", icon = icon("flask"))
+      
     )
   ),
   
   dashboardBody(
     tags$head(
+      tags$title("Ground Water Dashboard"),
+      tags$style(HTML(sprintf('
+      .skin-blue .main-header .logo { background-color: %s; color: white; }
+      .skin-blue .main-header .navbar { background-color: %s; }
+      body { background-color: %s; color: %s; }
+      .box { border-top-color: %s; }
+    ', iisc_palette["primary"], iisc_palette["secondary"],
+                              iisc_palette["background"], iisc_palette["text"],
+                              iisc_palette["accent"]))),
       tags$style(HTML("
-        .box { border-radius: 10px; box-shadow: 0 1px 5px rgba(0,0,0,0.1); }
-        .content-wrapper { background-color: #f8f9fa; }
-        .main-sidebar { background-color: #1e3d59; }
-        .skin-blue .sidebar a { color: #ffffff; }
-        .skin-blue .sidebar-menu>li.active>a {
-          background-color: #1e90ff; color: white;
-          font-weight: bold;
-        }
-        .form-control, .selectpicker {
-          border-radius: 8px !important;
-        }
-        .box-title {
-          font-weight: bold;
-          color: #1e3d59;
-        }
-      "))
+      .main-header {
+        height: 60px !important; /* Adjust this value as needed */
+      }
+      .main-header .logo {
+        height: 60px !important; /* Match the main-header height */
+        line-height: 60px !important; /* Vertically center the logo text if any (though you have images) */
+      }
+      .main-header .navbar {
+        min-height: 60px !important; /* Ensure navbar doesn't collapse */
+      }
+      .main-header .title {
+        height: 60px !important; /* Match the main-header height */
+        line-height: 60px !important; /* Vertically center the title text */
+      }
+      .main-header .title > div { /* Target the div containing your logos and text */
+        display: flex;
+        align-items: center; /* Vertically align items within the div */
+        height: 100%; /* Ensure the div takes full height of the title */
+      }
+    "))
     ),
     
+    # ... rest of your dashboardBody ...
+    
+    
     tabItems(
-      # File Upload Tab
       tabItem(tabName = "upload",
               fluidRow(
-                box(width = 6, title = "Upload Groundwater Data", status = "primary", solidHeader = TRUE,
+                box(title = "Upload GPKG File", status = "primary", solidHeader = TRUE,
                     fileInput("gpkg_upload", "Choose GPKG File", accept = c(".gpkg")),
-                    actionButton("load_data", "Load Data", icon = icon("sync"))
+                    actionButton("load_data", "Load Data", icon = icon("database"))
                 ),
-                box(width = 6, title = "File Info", status = "info", solidHeader = TRUE,
+                box(title = "File Information", status = "success", solidHeader = TRUE,
                     verbatimTextOutput("file_info"))
               )
       ),
       
-      # Data Exploration Tab
       tabItem(tabName = "data_explore",
               fluidRow(
-                box(width = 6, title = "Dataset Overview", status = "primary", solidHeader = TRUE, uiOutput("dataset_summary")),
-                box(width = 6, title = "Column Metadata", status = "info", solidHeader = TRUE, DTOutput("column_details"))
+                box(title = "Dataset Overview", status = "primary", solidHeader = TRUE, uiOutput("dataset_summary")),
+                box(title = "Column Details", status = "success", solidHeader = TRUE, DTOutput("column_details"))
               ),
               fluidRow(
-                box(width = 6, title = "Sample Data Preview", status = "warning", solidHeader = TRUE, DTOutput("data_preview")),
-                box(width = 6, title = "Statistics Summary", status = "success", solidHeader = TRUE, uiOutput("data_statistics"))
+                box(title = "Data Preview", status = "warning", solidHeader = TRUE, DTOutput("data_preview")),
+                box(title = "Data Statistics", status = "info", solidHeader = TRUE, uiOutput("data_statistics"))
               )
       ),
       
-      # Chemistry Tab
       tabItem(tabName = "chemistry",
               fluidRow(
-                box(width = 4, title = "📍 Select Location(s)", status = "primary", solidHeader = TRUE,
-                    pickerInput("location_filter", label = "Location(s)",
-                                choices = NULL, multiple = TRUE,
-                                options = list(
-                                  "actions-box" = TRUE,
-                                  "live-search" = TRUE,
-                                  "selected-text-format" = "count > 2"
-                                ))
-                ),
-                box(width = 8, title = "Piper Diagram", status = "info", solidHeader = TRUE,
+                box(title = "Filters", status = "info", solidHeader = TRUE, width = 12,
+                    fluidRow(
+                      column(4, selectInput("state_chem", "State", choices = NULL)),
+                      column(4, selectInput("district_chem", "District", choices = NULL)),
+                      column(4, selectInput("block_chem", "Block", choices = NULL))
+                    ),
+                    br(),
+                    uiOutput("download_chemistry_ui")
+                )
+              ),
+              fluidRow(
+                box(title = "Piper Plot", status = "primary", solidHeader = TRUE, width = 12,
                     withSpinner(plotOutput("piper_plot", height = "700px"), type = 6)
+                )
+              ),
+              fluidRow(
+                box(title = "Chemical Composition", status = "success", solidHeader = TRUE, width = 12,
+                    #withSpinner(plotOutput("chemCompPlot", height = "700px"), type = 6)
+                )
+              ),
+              fluidRow(
+                box(title = "Water Types", status = "warning", solidHeader = TRUE, width = 12,
+                    #withSpinner(uiOutput("water_types_section"), type = 6)
+                )
+              ),
+              fluidRow(
+                box(title = "Suggested Measures", status = "info", solidHeader = TRUE, width = 12,
+                    #withSpinner(uiOutput("measures_section"), type = 6)
                 )
               )
       )
@@ -120,20 +230,67 @@ ui <- dashboardPage(
 
 # Server
 server <- function(input, output, session) {
-  data_storage <- reactiveValues(csv_data = get_sample_data(), data_loaded = FALSE)
+  
+  data_storage <- reactiveValues(csv_data = NULL, sf_data = NULL, water_sf = NULL, data_loaded = FALSE)
   
   observeEvent(input$load_data, {
     req(input$gpkg_upload)
     tryCatch({
-      showNotification("Custom GPKG upload not yet handled in this version", type = "warning")
+      water_sf <- calculate_wqi(input$gpkg_upload$datapath)
+      data_storage$csv_data <- st_drop_geometry(water_sf)
+      data_storage$sf_data <- water_sf
+      data_storage$water_sf <- water_sf
+      data_storage$data_loaded <- TRUE
+      
+      # Update State choices immediately after data load
+      updateSelectInput(session, "state_chem", choices = c("Select State", unique(data_storage$csv_data$STATE_UT)), selected = "Select State")
+      updateSelectInput(session, "state_filter", choices = c("None", unique(data_storage$water_sf$STATE_UT)), selected = "None")
+      # update Districts when State is selected:
+      
+      
+      observeEvent(input$state_chem, {
+        req(data_storage$water_sf)
+        districts <- data_storage$water_sf %>%
+          filter(STATE_UT == input$state_chem) %>%
+          pull(DISTRICT) %>%
+          unique() %>%
+          sort()
+        updateSelectInput(session, "district_chem", choices = c("Select District", districts))
+      })
+      #Update Blocks when District is selected:
+      
+      
+      observeEvent(input$district_chem, {
+        req(data_storage$water_sf)
+        blocks <- data_storage$water_sf %>%
+          filter(STATE_UT == input$state_chem, DISTRICT == input$district_chem) %>%
+          pull(BLOCK) %>%
+          unique() %>%
+          sort()
+        updateSelectInput(session, "block_chem", choices = c("Select Block", blocks))
+      })
+      # Reset subsequent filters
+      updateSelectInput(session, "district_chem", choices = "Select District", selected = "Select District")
+      updateSelectInput(session, "block_chem", choices = "Select Block", selected = "Select Block")
+      updateSelectInput(session, "district_filter", choices = c("None"), selected = "None")
+      updateSelectInput(session, "block_filter", choices = c("None"), selected = "None")
+      
+      # 
+      # # Update pickerInput choices
+      # updatePickerInput(session, "wqiClass",
+      #                   choices = unique(water_sf$Quality),
+      #                   selected = unique(water_sf$Quality))
+      
+      showNotification("GPKG loaded and WQI calculated successfully!", type = "message")
     }, error = function(e) {
-      showNotification(paste("Error processing file:", e$message), type = "error")
+      showNotification(paste("Error processing GPKG file:", e$message), type = "error")
+      data_storage$data_loaded <- FALSE
     })
   })
   
   output$file_info <- renderPrint({
     req(data_storage$csv_data)
-    cat("File or Sample Data Loaded\n",
+    cat("File Uploaded Successfully!\n",
         "Number of Rows:", nrow(data_storage$csv_data), "\n",
         "Number of Columns:", ncol(data_storage$csv_data))
   })
@@ -168,53 +325,52 @@ server <- function(input, output, session) {
     numeric_cols <- names(data_storage$csv_data)[sapply(data_storage$csv_data, is.numeric)]
     if (length(numeric_cols) > 0) {
       stats <- data_storage$csv_data %>%
-        summarise(across(all_of(numeric_cols), list(Mean = mean, Median = median, Min = min, Max = max, SD = sd), na.rm = TRUE))
+        select(all_of(numeric_cols)) %>%
+        summarise(across(everything(), list(Mean = mean, Median = median, Min = min, Max = max, SD = sd), na.rm = TRUE))
       HTML(paste("<h4>Numeric Column Statistics</h4><pre>", capture.output(print(stats)), "</pre>"))
     } else HTML("<p>No numeric columns found.</p>")
   })
-  
-  # Update Location Filter
-  observe({
-    df <- data_storage$csv_data
-    updatePickerInput(session, "location_filter",
-                      choices = unique(df$LOCATION_NAME),
-                      selected = unique(df$LOCATION_NAME))
-  })
-  
-  # Piper Plot
   output$piper_plot <- renderPlot({
-    req(data_storage$csv_data)
-    df <- data_storage$csv_data
+    req(data_storage$water_sf)
     
-    selected_locs <- input$location_filter
-    if (!is.null(selected_locs)) {
-      df <- df %>% filter(LOCATION_NAME %in% selected_locs)
-    }
+    # Filtered Data
+    filtered_data <- data_storage$water_sf %>%
+      filter(
+        STATE_UT == input$state_chem,
+        DISTRICT == input$district_chem,
+        BLOCK == input$block_chem
+      )
     
-    required_cols <- c("CA", "MG", "Sodium", "K", "CHLORIDE", "SULPHATE", "BICARBONATE")
-    if (!all(required_cols %in% colnames(df))) {
-      showNotification("Required ions missing for Piper plot", type = "error")
+    # Ensure required columns are present
+    required_cols <- c("CA", "MG", "Sodium", "CHLORIDE", "BICARBONATE", "SULPHATE")
+    if (!all(required_cols %in% names(filtered_data))) {
+      showNotification("Some required parameters are missing for Piper Plot.", type = "error")
       return(NULL)
     }
     
-    to_meq <- function(mgL, mol_weight, valence) {
-      (mgL / mol_weight) * valence
-    }
+    # Convert to meq/L
+    PD <- transform(filtered_data,
+                    Ca.meq = conc2meq(CA, "calcium"),
+                    Mg.meq = conc2meq(MG, "magnesium"),
+                    Na.meq = conc2meq(Sodium, "sodium"),
+                    Cl.meq = conc2meq(CHLORIDE, "chloride"),
+                    SO4.meq = conc2meq(SULPHATE, "sulfate"),
+                    HCO3.meq = conc2meq(BICARBONATE, "bicarb"))
     
-    Ca <- to_meq(df$CA, 40.08, 2)
-    Mg <- to_meq(df$MG, 24.31, 2)
-    NaK <- to_meq(df$Sodium + df$K, 22.99, 1)
-    Cl <- to_meq(df$CHLORIDE, 35.45, 1)
-    SO4 <- to_meq(df$SULPHATE, 96.06, 2)
-    HCO3 <- to_meq(df$BICARBONATE, 61.02, 1)
+    PD$SS <- paste0("Sample-", seq_len(nrow(PD)))
     
-    sample_labels <- df$LOCATION_NAME
-    
-    piperPlot(Ca, Mg, NaK, Cl, SO4, HCO3,
-              Plot = list(name = sample_labels),
-              caption = "Piper Diagram – Groundwater Chemistry")
+    # Plot
+    piperPlot(PD$Ca.meq, PD$Mg.meq, PD$Na.meq, 
+              PD$Cl.meq, PD$HCO3.meq, PD$SO4.meq, 
+              Plot = list(name = PD$SS, color = setColor(PD$SS)),
+              zCat.title = "Sodium",
+              xAn.title = "Chloride",
+              yAn.title = "Bicarbonate")
   })
+  
+  
 }
 
 # Run App
 shinyApp(ui, server)
+# The code which we are giving them in final(Water Chemistry, 3 Tabs)
